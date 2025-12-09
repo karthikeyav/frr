@@ -74,8 +74,6 @@
 
 extern struct host host;
 
-/* Forward declarations */
-
 FRR_CFG_DEFAULT_BOOL(BGP_IMPORT_CHECK,
 	{
 		.val_bool = false,
@@ -23658,6 +23656,8 @@ void bgp_vty_init(void)
 	install_element(BGP_NODE, &no_bgp_sid_vpn_export_cmd);
 
 	bgp_vty_if_init();
+
+	bgp_unreach_vty_init();
 }
 
 #include "memory.h"
