@@ -125,7 +125,7 @@ int bgp_unreach_reason_str2code(const char *str, uint16_t *code)
 	return 0;
 }
 
-/* Parse Reporter TLV from unreachability NLRI
+/* Parse TLVs from unreachability NLRI
  *
  * Extracts Reporter ID, Reporter AS, and Sub-TLVs (Reason Code, Timestamp).
  * Wire format documented at top of file.
@@ -473,9 +473,14 @@ int bgp_nlri_parse_unreach(struct peer *peer, struct attr *attr, struct bgp_nlri
 			bgp_withdraw(peer, &p, addpath_id, afi, safi,
 				     ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 				     NULL, NULL, 0);
+		} else if (attr) {
+			bgp_update(peer, &p, addpath_id, attr, afi, safi,
+				   ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
+				   NULL, NULL, 0, 0, NULL);
 		} else {
-			bgp_update(peer, &p, addpath_id, attr, afi, safi, ZEBRA_ROUTE_BGP,
-				   BGP_ROUTE_NORMAL, NULL, NULL, 0, 0, NULL);
+			if (BGP_DEBUG(update, UPDATE_IN))
+				zlog_debug("%s: Missing attributes for unreachability update %pFX, skipping",
+					   peer->host, &p);
 		}
 
 		/* Free temporary TLV data */
