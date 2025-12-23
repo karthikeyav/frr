@@ -11,6 +11,9 @@
 #include "prefix.h"
 #include "bgpd.h"
 
+extern const char *bgp_origin_str[];
+extern const char *bgp_origin_long_str[];
+
 /* Status codes for SAFI_UNREACH (informational only, not installed in RIB/FIB) */
 #define BGP_UNREACH_SHOW_SCODE_HEADER                                                              \
 	"Status codes:  s suppressed, d damped, h history, u unsorted, * valid, > best,\n"         \
@@ -118,7 +121,11 @@ extern struct bgp_unreach_info *bgp_unreach_info_new(struct prefix *prefix);
 extern void bgp_unreach_info_free(struct bgp_unreach_info *unreach);
 extern int bgp_unreach_info_add(struct bgp *bgp, afi_t afi, struct bgp_unreach_nlri *nlri,
 				struct attr *attr);
-extern void bgp_unreach_info_delete(struct bgp *bgp, afi_t afi, struct prefix *prefix);
-
+extern void bgp_unreach_info_delete(struct bgp *bgp, afi_t afi, const struct prefix *prefix);
+extern const char *bgp_unreach_reason_str(uint16_t code);
+extern int bgp_unreach_reason_str2code(const char *str, uint16_t *code);
+extern void bgp_unreach_show(struct vty *vty, struct bgp *bgp, afi_t afi,
+			     struct prefix *prefix, bool use_json, bool detail);
+extern void bgp_unreach_vty_init(void);
 
 #endif /* _QUAGGA_BGP_UNREACH_H */

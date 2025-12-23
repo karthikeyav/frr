@@ -64,6 +64,9 @@
 #include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_updgrp.h"
+#include "bgpd/bgp_community.h"
+#include "bgpd/bgp_ecommunity.h"
+#include "bgpd/bgp_trace.h"
 
 DEFINE_MTYPE_STATIC(BGPD, BGP_UNREACH_INFO, "BGP Unreachability Information");
 
@@ -165,8 +168,9 @@ int bgp_unreach_tlv_parse(uint8_t *data, uint16_t len, struct bgp_unreach_nlri *
 	}
 
 	uint8_t tlv_type = *pnt++;
-	uint16_t tlv_len = ((uint16_t)*pnt++ << 8);
+	uint16_t tlv_len;
 
+	tlv_len = ((uint16_t)*pnt++ << 8);
 	tlv_len |= *pnt++;
 
 	/* Validate Reporter TLV Type */
@@ -218,8 +222,9 @@ int bgp_unreach_tlv_parse(uint8_t *data, uint16_t len, struct bgp_unreach_nlri *
 		}
 
 		uint8_t sub_type = *pnt++;
-		uint16_t sub_len = ((uint16_t)*pnt++ << 8);
+		uint16_t sub_len;
 
+		sub_len = ((uint16_t)*pnt++ << 8);
 		sub_len |= *pnt++;
 
 		if (pnt + sub_len > reporter_end) {
@@ -438,9 +443,8 @@ int bgp_nlri_parse_unreach(struct peer *peer, struct attr *attr, struct bgp_nlri
 				return BGP_NLRI_PARSE_ERROR;
 			}
 
-			/*
-			 * Advance pointer past THIS NLRI's Reporter TLV
-			 * to next NLRI.
+			/* Advance pointer past THIS NLRI's Reporter
+			 * TLV to next NLRI.
 			 *
 			 * We expect 1 Reporter TLV per NLRI. If sender
 			 * includes multiple Reporter TLVs without
@@ -466,8 +470,9 @@ int bgp_nlri_parse_unreach(struct peer *peer, struct attr *attr, struct bgp_nlri
 		}
 
 		if (withdraw) {
-			bgp_withdraw(peer, &p, addpath_id, afi, safi, ZEBRA_ROUTE_BGP,
-				     BGP_ROUTE_NORMAL, NULL, NULL, 0, NULL);
+			bgp_withdraw(peer, &p, addpath_id, afi, safi,
+				     ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
+				     NULL, NULL, 0);
 		} else {
 			bgp_update(peer, &p, addpath_id, attr, afi, safi, ZEBRA_ROUTE_BGP,
 				   BGP_ROUTE_NORMAL, NULL, NULL, 0, 0, NULL);
@@ -534,7 +539,7 @@ int bgp_unreach_info_add(struct bgp *bgp, afi_t afi, struct bgp_unreach_nlri *nl
 			attr_new = *attr;
 		} else {
 			/* Set default attributes for locally originated route */
-			bgp_attr_default_set(&attr_new, bgp, BGP_ORIGIN_IGP);
+			bgp_attr_default_set(&attr_new, bgp, BGP_ORIGIN_INCOMPLETE);
 		}
 
 		/* Set nexthop length to 0 for SAFI_UNREACH (no nexthop, like Flowspec) */
@@ -600,7 +605,7 @@ int bgp_unreach_info_add(struct bgp *bgp, afi_t afi, struct bgp_unreach_nlri *nl
 }
 
 /* Delete unreachability information */
-void bgp_unreach_info_delete(struct bgp *bgp, afi_t afi, struct prefix *prefix)
+void bgp_unreach_info_delete(struct bgp *bgp, afi_t afi, const struct prefix *prefix)
 {
 	struct bgp_dest *dest;
 	struct bgp_path_info *bpi;
@@ -643,4 +648,679 @@ void bgp_unreach_nlri_encode(struct stream *s, struct bgp_unreach_nlri *unreach,
 	bgp_unreach_tlv_encode(s, unreach);
 }
 
+/*
+ * Populate a JSON path object with detailed fields for one
+ * unreachability path (TLVs, peer, origin, flags, communities, aspath).
+ */
+static void bgp_unreach_path_detail_json(json_object *json_path,
+					 struct bgp_path_info *pi)
+{
+	struct bgp_path_info_extra_unreach *ud =
+		(pi->extra) ? pi->extra->unreach : NULL;
+
+	if (ud && ud->has_reporter) {
+		char reporter[INET_ADDRSTRLEN];
+
+		inet_ntop(AF_INET, &ud->reporter,
+			  reporter, sizeof(reporter));
+		json_object_string_add(json_path, "reporter", reporter);
+	}
+	if (ud && ud->has_reporter_as)
+		json_object_int_add(json_path, "reporterAs",
+				    ud->reporter_as);
+
+	if (ud && ud->has_reason_code) {
+		const char *reason_str =
+			bgp_unreach_reason_str(ud->reason_code);
+
+		json_object_string_add(json_path, "reason", reason_str);
+	}
+
+	if (ud && ud->has_timestamp) {
+		time_t ts = (time_t)ud->timestamp;
+		char timebuf[64];
+		json_object *json_ts = json_object_new_object();
+
+		json_object_int_add(json_ts, "epoch", ts);
+		json_object_string_add(json_ts, "string",
+				       ctime_r(&ts, timebuf));
+		json_object_object_add(json_path, "timestamp", json_ts);
+	}
+
+	if (pi->peer) {
+		json_object_string_addf(json_path, "peer", "%pSU",
+					&pi->peer->connection->su);
+		if (pi->peer->hostname)
+			json_object_string_add(json_path, "peerHostname",
+					       pi->peer->hostname);
+	}
+
+	if (pi->attr)
+		json_object_string_add(json_path, "origin",
+				       bgp_origin_long_str[pi->attr->origin]);
+
+	json_object_boolean_add(json_path, "valid",
+				CHECK_FLAG(pi->flags, BGP_PATH_VALID));
+	json_object_boolean_add(json_path, "best",
+				CHECK_FLAG(pi->flags, BGP_PATH_SELECTED));
+	json_object_boolean_add(json_path, "stale",
+				CHECK_FLAG(pi->flags, BGP_PATH_STALE));
+	json_object_boolean_add(json_path, "multipath",
+				CHECK_FLAG(pi->flags, BGP_PATH_MULTIPATH));
+
+	if (pi->peer && pi->peer->sort == BGP_PEER_IBGP)
+		json_object_string_add(json_path, "pathFrom", "internal");
+	else if (pi->peer && pi->peer->sort == BGP_PEER_EBGP)
+		json_object_string_add(json_path, "pathFrom", "external");
+
+	{
+		time_t tbuf = time(NULL) - (monotime(NULL) - pi->uptime);
+		char timebuf[64];
+		json_object *json_last_update = json_object_new_object();
+
+		json_object_int_add(json_last_update, "epoch", tbuf);
+		json_object_string_add(json_last_update, "string",
+				       ctime_r(&tbuf, timebuf));
+		json_object_object_add(json_path, "lastUpdate",
+				       json_last_update);
+	}
+
+	if (pi->attr &&
+	    (pi->attr->flag & ATTR_FLAG_BIT(BGP_ATTR_COMMUNITIES))) {
+		struct community *comm = bgp_attr_get_community(pi->attr);
+
+		if (comm) {
+			if (!comm->json)
+				community_str(comm, true, true);
+			json_object_lock(comm->json);
+			json_object_object_add(json_path, "community",
+					       comm->json);
+		}
+	}
+
+	if (pi->attr && bgp_attr_get_ecommunity(pi->attr)) {
+		struct ecommunity *ecomm =
+			bgp_attr_get_ecommunity(pi->attr);
+		json_object *json_ecomm = json_object_new_object();
+
+		json_object_string_add(json_ecomm, "string", ecomm->str);
+		json_object_object_add(json_path, "extendedCommunity",
+				       json_ecomm);
+	}
+
+	if (pi->attr && pi->attr->aspath) {
+		json_object *json_aspath = json_object_new_object();
+
+		json_object_string_add(json_aspath, "string",
+				       aspath_print(pi->attr->aspath));
+		json_object_int_add(json_aspath, "length",
+				    aspath_count_hops(pi->attr->aspath));
+		json_object_object_add(json_path, "aspath", json_aspath);
+	}
+}
+
+/*
+ * Populate a JSON path object with summary fields for one
+ * unreachability path (metric, locPrf, weight, reason, reporter,
+ * origin, flags, pathFrom, lastUpdate, ecommunity, from).
+ */
+static void bgp_unreach_path_summary_json(json_object *json_path,
+					   struct bgp_path_info *pi,
+					   struct bgp_path_info_extra_unreach *ud)
+{
+	if (pi->attr)
+		json_object_int_add(json_path, "metric", pi->attr->med);
+
+	if (pi->attr &&
+	    (pi->attr->flag & ATTR_FLAG_BIT(BGP_ATTR_LOCAL_PREF)))
+		json_object_int_add(json_path, "locPrf",
+				    pi->attr->local_pref);
+
+	if (pi->attr)
+		json_object_int_add(json_path, "weight",
+				    pi->attr->weight);
+
+	if (ud && ud->has_reason_code) {
+		const char *reason_str =
+			bgp_unreach_reason_str(ud->reason_code);
+
+		json_object_string_add(json_path, "reason", reason_str);
+	}
+
+	if (ud) {
+		char reporter_ip[INET_ADDRSTRLEN];
+
+		inet_ntop(AF_INET, &ud->reporter,
+			  reporter_ip, sizeof(reporter_ip));
+		json_object_string_add(json_path, "reporter",
+				       reporter_ip);
+		json_object_int_add(json_path, "reporterAs",
+				    ud->reporter_as);
+	}
+
+	if (pi->attr && pi->attr->aspath)
+		json_object_string_add(json_path, "path",
+				       pi->attr->aspath->str);
+
+	if (pi->attr)
+		json_object_string_add(json_path, "origin",
+				       bgp_origin_long_str[pi->attr->origin]);
+
+	json_object_boolean_add(json_path, "valid",
+				CHECK_FLAG(pi->flags, BGP_PATH_VALID));
+	json_object_boolean_add(json_path, "best",
+				CHECK_FLAG(pi->flags, BGP_PATH_SELECTED));
+	json_object_boolean_add(json_path, "stale",
+				CHECK_FLAG(pi->flags, BGP_PATH_STALE));
+	json_object_boolean_add(json_path, "multipath",
+				CHECK_FLAG(pi->flags, BGP_PATH_MULTIPATH));
+
+	if (pi->peer && pi->peer->sort == BGP_PEER_IBGP)
+		json_object_string_add(json_path, "pathFrom", "internal");
+	else if (pi->peer && pi->peer->sort == BGP_PEER_EBGP)
+		json_object_string_add(json_path, "pathFrom", "external");
+
+	{
+		time_t tbuf = time(NULL) - (monotime(NULL) - pi->uptime);
+		char timebuf[64];
+		json_object *json_last_update = json_object_new_object();
+
+		json_object_int_add(json_last_update, "epoch", tbuf);
+		json_object_string_add(json_last_update, "string",
+				       ctime_r(&tbuf, timebuf));
+		json_object_object_add(json_path, "lastUpdate",
+				       json_last_update);
+	}
+
+	if (pi->attr && bgp_attr_get_ecommunity(pi->attr)) {
+		json_object *json_ecomm = json_object_new_object();
+
+		json_object_string_add(json_ecomm, "string",
+				       bgp_attr_get_ecommunity(pi->attr)->str);
+		json_object_object_add(json_path, "extendedCommunity",
+				       json_ecomm);
+	}
+
+	if (pi->peer) {
+		json_object *json_from = json_object_new_object();
+
+		if (pi->peer->hostname)
+			json_object_string_add(json_from, "hostname",
+					       pi->peer->hostname);
+		if (pi->peer->conf_if)
+			json_object_string_add(json_from, "interface",
+					       pi->peer->conf_if);
+		else
+			json_object_string_addf(json_from, "peerId",
+						"%pSU",
+						&pi->peer->connection->su);
+		json_object_string_addf(json_from, "routerId", "%pI4",
+					&pi->peer->remote_id);
+		json_object_object_add(json_path, "from", json_from);
+	}
+}
+
+/*
+ * Print one VTY summary line for an unreachability path
+ * (status codes, prefix, metric, locPrf, weight, reason, reporter,
+ * aspath, origin).
+ */
+static void bgp_unreach_path_summary_vty(
+	struct vty *vty, struct bgp_path_info *pi,
+	struct bgp_path_info_extra_unreach *unreach_data,
+	afi_t afi, const char *prefix_display)
+{
+	char reporter_str[32] = "-";
+	char aspath_str[256] = "";
+	const char *reason_str = "";
+	char origin_str[2] = "";
+
+	if (unreach_data) {
+		char reporter_ip[INET_ADDRSTRLEN];
+
+		inet_ntop(AF_INET, &unreach_data->reporter,
+			  reporter_ip, sizeof(reporter_ip));
+		snprintf(reporter_str, sizeof(reporter_str),
+			 "%s/%u", reporter_ip,
+			 unreach_data->reporter_as);
+
+		if (unreach_data->has_reason_code)
+			reason_str = bgp_unreach_reason_str(
+				unreach_data->reason_code);
+	}
+
+	if (pi->attr && pi->attr->aspath) {
+		const char *aspath_tmp = aspath_print(pi->attr->aspath);
+
+		if (aspath_tmp)
+			snprintf(aspath_str, sizeof(aspath_str),
+				 "%s", aspath_tmp);
+	}
+
+	if (pi->attr)
+		snprintf(origin_str, sizeof(origin_str), "%s",
+			 bgp_origin_str[pi->attr->origin]);
+
+	/* Status codes */
+	vty_out(vty, " ");
+
+	if (CHECK_FLAG(pi->flags, BGP_PATH_REMOVED))
+		vty_out(vty, "R");
+	else if (CHECK_FLAG(pi->flags, BGP_PATH_STALE))
+		vty_out(vty, "S");
+	else if (bgp_path_suppressed(pi))
+		vty_out(vty, "s");
+	else if (CHECK_FLAG(pi->flags, BGP_PATH_VALID) &&
+		 !CHECK_FLAG(pi->flags, BGP_PATH_HISTORY))
+		vty_out(vty, "*");
+	else
+		vty_out(vty, " ");
+
+	if (CHECK_FLAG(pi->flags, BGP_PATH_HISTORY))
+		vty_out(vty, "h");
+	else if (CHECK_FLAG(pi->flags, BGP_PATH_UNSORTED))
+		vty_out(vty, "u");
+	else if (CHECK_FLAG(pi->flags, BGP_PATH_DAMPED))
+		vty_out(vty, "d");
+	else if (CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
+		vty_out(vty, ">");
+	else if (CHECK_FLAG(pi->flags, BGP_PATH_MULTIPATH))
+		vty_out(vty, "=");
+	else
+		vty_out(vty, " ");
+
+	if (pi->peer && (pi->peer->as) &&
+	    (pi->peer->as == pi->peer->local_as))
+		vty_out(vty, "i");
+	else
+		vty_out(vty, " ");
+
+	if (afi == AFI_IP) {
+		if (pi->attr &&
+		    (pi->attr->flag &
+		     ATTR_FLAG_BIT(BGP_ATTR_LOCAL_PREF)))
+			vty_out(vty,
+				" %-18s %7u %7u %7u %-19s %-17s %s %s\n",
+				prefix_display, pi->attr->med,
+				pi->attr->local_pref,
+				pi->attr->weight, reason_str,
+				reporter_str, aspath_str,
+				origin_str);
+		else
+			vty_out(vty,
+				" %-18s %7u        %7u %-19s %-17s %s %s\n",
+				prefix_display,
+				pi->attr ? pi->attr->med : 0,
+				pi->attr ? pi->attr->weight : 0,
+				reason_str, reporter_str,
+				aspath_str, origin_str);
+	} else {
+		if (pi->attr &&
+		    (pi->attr->flag &
+		     ATTR_FLAG_BIT(BGP_ATTR_LOCAL_PREF)))
+			vty_out(vty,
+				" %-48s %7u %7u %7u %-19s %-17s %s %s\n",
+				prefix_display, pi->attr->med,
+				pi->attr->local_pref,
+				pi->attr->weight, reason_str,
+				reporter_str, aspath_str,
+				origin_str);
+		else
+			vty_out(vty,
+				" %-48s %7u        %7u %-19s %-17s %s %s\n",
+				prefix_display,
+				pi->attr ? pi->attr->med : 0,
+				pi->attr ? pi->attr->weight : 0,
+				reason_str, reporter_str,
+				aspath_str, origin_str);
+	}
+}
+
+/*
+ * Build an "advertisedTo" JSON object for a destination.
+ * Returns NULL if no peers advertise this route.
+ */
+static json_object *bgp_unreach_advertised_to_json(struct bgp *bgp,
+						   struct bgp_dest *dest)
+{
+	json_object *json_adv_to = NULL;
+	struct peer *peer;
+	struct listnode *node, *nnode;
+
+	for (ALL_LIST_ELEMENTS(bgp->peer, node, nnode, peer)) {
+		if (bgp_adj_out_lookup(peer, dest, 0)) {
+			json_object *json_peer;
+
+			if (!json_adv_to)
+				json_adv_to = json_object_new_object();
+			json_peer = json_object_new_object();
+
+			if (peer->hostname)
+				json_object_string_add(json_peer, "hostname",
+						       peer->hostname);
+			if (peer->conf_if)
+				json_object_object_add(json_adv_to,
+						       peer->conf_if,
+						       json_peer);
+			else {
+				char peer_str[SU_ADDRSTRLEN];
+
+				sockunion2str(&peer->connection->su,
+					      peer_str, sizeof(peer_str));
+				json_object_object_add(json_adv_to,
+						       peer_str, json_peer);
+			}
+		}
+	}
+
+	return json_adv_to;
+}
+
 /* Show unreachability information */
+void bgp_unreach_show(struct vty *vty, struct bgp *bgp, afi_t afi, struct prefix *prefix,
+		      bool use_json, bool detail)
+{
+	struct bgp_table *table;
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi;
+	json_object *json = NULL;
+	json_object *json_paths = NULL;
+	int count = 0;
+
+	if (!bgp) {
+		if (use_json)
+			vty_out(vty, "{}\n");
+		return;
+	}
+
+	table = bgp->rib[afi][SAFI_UNREACH];
+	if (!table) {
+		if (use_json)
+			vty_out(vty, "{}\n");
+		else
+			vty_out(vty, "No unreachability information\n");
+		return;
+	}
+
+	if (use_json)
+		json = json_object_new_object();
+
+	/* Show specific prefix or all */
+	if (prefix) {
+		dest = bgp_node_lookup(table, prefix);
+		if (!dest) {
+			if (use_json)
+				vty_json(vty, json);
+			else
+				vty_out(vty, "%% Network not in table\n");
+			return;
+		}
+
+		if (use_json)
+			json_paths = json_object_new_array();
+		else {
+			/* Print header once before looping through paths */
+			route_vty_out_detail_header(vty, bgp, dest, prefix,
+						    NULL, afi, SAFI_UNREACH,
+						    NULL, false, false);
+		}
+
+		int multi_path_count = 0;
+
+		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+			count++;
+			if (CHECK_FLAG(pi->flags, BGP_PATH_MULTIPATH))
+				multi_path_count++;
+
+			if (use_json) {
+				json_object *json_path = json_object_new_object();
+
+				bgp_unreach_path_detail_json(json_path, pi);
+				json_object_array_add(json_paths, json_path);
+			} else {
+				/* Use standard BGP route detail display for single prefix */
+				route_vty_out_detail(vty, bgp, dest, prefix,
+						     pi, afi, SAFI_UNREACH,
+						     RPKI_NOT_BEING_USED,
+						     NULL, NULL, 0);
+			}
+		}
+
+		if (use_json) {
+			json_object_object_add(json, "paths", json_paths);
+			json_object_int_add(json, "pathCount", count);
+			json_object_int_add(json, "multiPathCount", multi_path_count);
+
+			json_object *json_adv_to =
+				bgp_unreach_advertised_to_json(bgp, dest);
+
+			if (json_adv_to)
+				json_object_object_add(json, "advertisedTo",
+						       json_adv_to);
+
+			vty_json(vty, json);
+		}
+
+		bgp_dest_unlock_node(dest);
+	} else {
+		/* Show all unreachability information */
+
+		/* If detail flag, use detailed output per route */
+		if (detail) {
+			int prefix_count = 0;
+
+			if (use_json)
+				json = json_object_new_object();
+
+			for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+				const struct prefix *p = bgp_dest_get_prefix(dest);
+				bool has_paths = false;
+
+				if (use_json) {
+					json_paths = json_object_new_array();
+					char prefix_str[PREFIX2STR_BUFFER];
+
+					prefix2str(p, prefix_str, sizeof(prefix_str));
+
+					for (pi = bgp_dest_get_bgp_path_info(dest); pi;
+					     pi = pi->next) {
+						json_object *json_path =
+							json_object_new_object();
+
+						bgp_unreach_path_detail_json(
+							json_path, pi);
+						json_object_array_add(json_paths,
+								      json_path);
+						count++;
+						has_paths = true;
+					}
+
+					json_object_object_add(json, prefix_str, json_paths);
+				} else {
+					/* VTY detail output */
+					for (pi = bgp_dest_get_bgp_path_info(dest); pi;
+					     pi = pi->next) {
+						route_vty_out_detail_header(
+							vty, bgp, dest, p,
+							NULL, afi,
+							SAFI_UNREACH, NULL,
+							false, false);
+						route_vty_out_detail(
+							vty, bgp, dest,
+							p, pi, afi,
+							SAFI_UNREACH,
+							RPKI_NOT_BEING_USED,
+							NULL, NULL, 0);
+						count++;
+						has_paths = true;
+					}
+				}
+
+				if (has_paths)
+					prefix_count++;
+			}
+
+			if (use_json) {
+				vty_json(vty, json);
+			} else {
+				vty_out(vty,
+					"\nDisplayed %d routes and %d total paths\n",
+					prefix_count, count);
+			}
+			return;
+		}
+
+		/* Summary view */
+		if (!use_json) {
+			/* Print table header with status code legends (same as ipv4 unicast) */
+			vty_out(vty,
+				"BGP table version is %" PRIu64 ", local router ID is %pI4, vrf id %u\n",
+				table->version, &bgp->router_id,
+				bgp->vrf_id);
+			vty_out(vty, "Default local pref %u, local AS %u\n",
+				bgp->default_local_pref, bgp->as);
+			vty_out(vty, BGP_UNREACH_SHOW_SCODE_HEADER);
+			vty_out(vty, BGP_SHOW_OCODE_HEADER);
+			vty_out(vty, BGP_SHOW_RPKI_HEADER);
+
+			/* SAFI_UNREACH specific information */
+			vty_out(vty,
+				"Note: Unreachability routes are informational only and not installed in RIB/FIB\n");
+			vty_out(vty, "Reason: Unreachability reason code\n");
+			vty_out(vty, "Reporter: BGP router ID of the original reporter\n\n");
+
+			/* Column header - use macros to match standard BGP style */
+			if (afi == AFI_IP)
+				vty_out(vty, BGP_UNREACH_SHOW_HEADER);
+			else
+				vty_out(vty, BGP_UNREACH_SHOW_HEADER_WIDE);
+		}
+
+		int prefix_count = 0; /* Count unique prefixes */
+
+		for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+			const struct prefix *p = bgp_dest_get_prefix(dest);
+			char buf[PREFIX2STR_BUFFER];
+			bool first_path = true;
+			int prefix_path_count = 0;
+			int multi_path_count = 0;
+			json_object *json_route_for_prefix = NULL;
+			bool has_paths = false;
+
+			for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+				struct bgp_path_info_extra_unreach *unreach_data = NULL;
+
+				if (pi->extra && pi->extra->unreach)
+					unreach_data = pi->extra->unreach;
+
+				count++; /* Count total paths/entries */
+				prefix_path_count++;
+				has_paths = true;
+
+				/* Count multipath routes */
+				if (CHECK_FLAG(pi->flags, BGP_PATH_MULTIPATH))
+					multi_path_count++;
+
+				if (use_json) {
+					json_object *json_route = NULL;
+					json_object *json_path = NULL;
+
+					json_paths = NULL;
+					char prefix_str[PREFIX2STR_BUFFER];
+
+					/* Get or create route object for this prefix */
+					prefix2str(p, prefix_str, sizeof(prefix_str));
+					if (!json_object_object_get_ex(
+						    json, prefix_str,
+						    &json_route)) {
+						json_route =
+							json_object_new_object();
+						json_object_string_add(
+							json_route, "prefix",
+							prefix_str);
+						json_paths =
+							json_object_new_array();
+						json_object_object_add(
+							json_route, "paths",
+							json_paths);
+						json_object_object_add(
+							json, prefix_str,
+							json_route);
+					} else {
+						json_object_object_get_ex(
+							json_route, "paths",
+							&json_paths);
+					}
+
+					json_path = json_object_new_object();
+					bgp_unreach_path_summary_json(
+						json_path, pi, unreach_data);
+					json_object_array_add(json_paths, json_path);
+
+					/* Save reference for adding counts after loop */
+					json_route_for_prefix = json_route;
+				} else {
+					const char *prefix_display =
+						first_path
+							? prefix2str(p, buf,
+								     sizeof(buf))
+							: "";
+
+					bgp_unreach_path_summary_vty(
+						vty, pi, unreach_data,
+						afi, prefix_display);
+					first_path = false;
+				}
+			}
+
+			/* Add route-level fields */
+			if (use_json && json_route_for_prefix) {
+				json_object_int_add(json_route_for_prefix, "pathCount",
+						    prefix_path_count);
+				json_object_int_add(json_route_for_prefix, "multiPathCount",
+						    multi_path_count);
+
+				/* Add flags object */
+				json_object *json_flags = json_object_new_object();
+				struct bgp_path_info *pi_check;
+				bool has_bestpath = false;
+
+				for (pi_check = bgp_dest_get_bgp_path_info(dest); pi_check;
+				     pi_check = pi_check->next) {
+					if (CHECK_FLAG(pi_check->flags, BGP_PATH_SELECTED)) {
+						has_bestpath = true;
+						break;
+					}
+				}
+				json_object_string_add(json_flags, "bestPathExists",
+						       has_bestpath ? "true" : "false");
+				json_object_object_add(json_route_for_prefix, "flags", json_flags);
+
+				json_object *json_adv_to =
+					bgp_unreach_advertised_to_json(bgp,
+								       dest);
+
+				if (json_adv_to)
+					json_object_object_add(
+						json_route_for_prefix,
+						"advertisedTo", json_adv_to);
+			}
+
+			if (has_paths)
+				prefix_count++;
+		}
+
+		if (use_json) {
+			/* Add numPrefixes (consistent with unicast) */
+			json_object_int_add(json, "numPrefixes", prefix_count);
+			vty_json(vty, json);
+		} else {
+			if (count == 0)
+				vty_out(vty, "No unreachability information\n");
+			else
+				vty_out(vty,
+					"\nDisplayed %d routes and %d total paths\n",
+					prefix_count, count);
+		}
+	}
+}
