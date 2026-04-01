@@ -122,6 +122,161 @@ int bgp_unreach_reason_str2code(const char *str, uint16_t *code)
 	return 0;
 }
 
+/* Parse Reporter TLV from unreachability NLRI
+ *
+ * Extracts Reporter ID, Reporter AS, and Sub-TLVs (Reason Code, Timestamp).
+ * Wire format documented at top of file.
+ *
+ * Parameters:
+ *   data - Pointer to start of ONE Reporter TLV (Type + Length + payload)
+ *   len  - Length of THIS Reporter TLV only (caller pre-calculated)
+ *   unreach - Output structure to store parsed fields
+ *
+ * Returns:
+ *   0 on success
+ *   -1 on parse error
+ */
+int bgp_unreach_tlv_parse(uint8_t *data, uint16_t len, struct bgp_unreach_nlri *unreach)
+{
+	uint8_t *pnt = data;
+	uint8_t *end = data + len;
+
+	/* Initialize */
+	memset(&unreach->reporter, 0, sizeof(unreach->reporter));
+	unreach->reporter_as = 0;
+	unreach->reason_code = 0;
+	unreach->timestamp = 0;
+	unreach->has_reason_code = false;
+	unreach->has_timestamp = false;
+	unreach->has_reporter = false;
+	unreach->has_reporter_as = false;
+
+	/* Validate minimum length for Reporter TLV */
+	if (len < BGP_UNREACH_REPORTER_TLV_MIN_LEN) {
+		zlog_err("Unreachability NLRI too short: %u bytes (min %u)", len,
+			 BGP_UNREACH_REPORTER_TLV_MIN_LEN);
+		return -1;
+	}
+
+	/* Parse Reporter TLV (Type 1 - mandatory container) */
+	if (pnt + BGP_UNREACH_TLV_HEADER_LEN > end) {
+		zlog_err("Truncated Reporter TLV header");
+		return -1;
+	}
+
+	uint8_t tlv_type = *pnt++;
+	uint16_t tlv_len = ((uint16_t)*pnt++ << 8);
+
+	tlv_len |= *pnt++;
+
+	/* Validate Reporter TLV Type */
+	if (tlv_type != BGP_UNREACH_TLV_TYPE_REPORTER) {
+		zlog_err("Invalid TLV type: expected %u (Reporter), got %u",
+			 BGP_UNREACH_TLV_TYPE_REPORTER, tlv_type);
+		return -1;
+	}
+
+	/* Validate Reporter TLV length */
+	if (tlv_len < BGP_UNREACH_REPORTER_FIXED_LEN) {
+		zlog_err("Reporter TLV too short: %u bytes (min %u)", tlv_len,
+			 BGP_UNREACH_REPORTER_FIXED_LEN);
+		return -1;
+	}
+
+	if (pnt + tlv_len > end) {
+		zlog_err("Reporter TLV length overflow: %u bytes", tlv_len);
+		return -1;
+	}
+
+	uint8_t *reporter_end = pnt + tlv_len;
+
+	/* Extract Reporter Identifier (4 bytes) - mandatory */
+	if (pnt + BGP_UNREACH_REPORTER_ID_LEN > reporter_end) {
+		zlog_err("Truncated Reporter Identifier");
+		return -1;
+	}
+	memcpy(&unreach->reporter, pnt, BGP_UNREACH_REPORTER_ID_LEN);
+	unreach->has_reporter = true;
+	pnt += BGP_UNREACH_REPORTER_ID_LEN;
+
+	/* Extract Reporter AS Number (4 bytes) - mandatory */
+	if (pnt + BGP_UNREACH_REPORTER_AS_LEN > reporter_end) {
+		zlog_err("Truncated Reporter AS Number");
+		return -1;
+	}
+	unreach->reporter_as = ((uint32_t)*pnt++ << 24);
+	unreach->reporter_as |= ((uint32_t)*pnt++ << 16);
+	unreach->reporter_as |= ((uint32_t)*pnt++ << 8);
+	unreach->reporter_as |= *pnt++;
+	unreach->has_reporter_as = true;
+
+	/* Parse Sub-TLVs */
+	while (pnt < reporter_end) {
+		if (pnt + BGP_UNREACH_SUBTLV_HEADER_LEN > reporter_end) {
+			zlog_err("Truncated Sub-TLV header");
+			return -1;
+		}
+
+		uint8_t sub_type = *pnt++;
+		uint16_t sub_len = ((uint16_t)*pnt++ << 8);
+
+		sub_len |= *pnt++;
+
+		if (pnt + sub_len > reporter_end) {
+			zlog_err("Sub-TLV length overflow: type=%u len=%u", sub_type, sub_len);
+			return -1;
+		}
+
+		/* Reject zero-length Sub-TLVs (invalid, no data) */
+		if (sub_len == 0) {
+			zlog_err("Zero-length Sub-TLV type %u", sub_type);
+			return -1;
+		}
+
+		switch (sub_type) {
+		case BGP_UNREACH_SUBTLV_TYPE_REASON_CODE:
+			if (sub_len != BGP_UNREACH_REASON_CODE_LEN) {
+				zlog_err("Invalid Reason Code Sub-TLV length: %u (expected %u)",
+					 sub_len, BGP_UNREACH_REASON_CODE_LEN);
+				return -1;
+			}
+			unreach->reason_code = ((uint16_t)*pnt << 8);
+			unreach->reason_code |= *(pnt + 1);
+			unreach->has_reason_code = true;
+			break;
+
+		case BGP_UNREACH_SUBTLV_TYPE_TIMESTAMP:
+			if (sub_len != BGP_UNREACH_TIMESTAMP_LEN) {
+				zlog_err("Invalid Timestamp Sub-TLV length: %u (expected %u)",
+					 sub_len, BGP_UNREACH_TIMESTAMP_LEN);
+				return -1;
+			}
+			unreach->timestamp = ((uint64_t)*pnt << 56);
+			unreach->timestamp |= ((uint64_t)*(pnt + 1) << 48);
+			unreach->timestamp |= ((uint64_t)*(pnt + 2) << 40);
+			unreach->timestamp |= ((uint64_t)*(pnt + 3) << 32);
+			unreach->timestamp |= ((uint64_t)*(pnt + 4) << 24);
+			unreach->timestamp |= ((uint64_t)*(pnt + 5) << 16);
+			unreach->timestamp |= ((uint64_t)*(pnt + 6) << 8);
+			unreach->timestamp |= *(pnt + 7);
+			unreach->has_timestamp = true;
+			break;
+
+		default:
+			break;
+		}
+
+		pnt += sub_len;
+	}
+
+	return 0;
+}
+
+/* Encode Reporter TLV into stream
+ *
+ * Encodes Reporter ID, Reporter AS, and Sub-TLVs (Reason Code, Timestamp).
+ * Wire format documented at top of file.
+ */
 int bgp_unreach_tlv_encode(struct stream *s, struct bgp_unreach_nlri *unreach)
 {
 	/* Calculate Reporter TLV total length:
@@ -171,6 +326,168 @@ int bgp_unreach_tlv_encode(struct stream *s, struct bgp_unreach_nlri *unreach)
  * Parses one or more UNREACH NLRIs from UPDATE message.
  * Wire format documented at top of file.
  */
+int bgp_nlri_parse_unreach(struct peer *peer, struct attr *attr, struct bgp_nlri *packet,
+			   bool withdraw)
+{
+	uint8_t *pnt;
+	uint8_t *lim;
+	struct prefix p;
+	int psize = 0;
+	uint8_t prefixlen;
+	afi_t afi;
+	safi_t safi;
+	uint32_t addpath_id;
+	bool addpath_capable;
+	struct bgp_unreach_nlri unreach;
+
+	/* Start processing the NLRI */
+	pnt = packet->nlri;
+	lim = pnt + packet->length;
+	afi = packet->afi;
+	safi = packet->safi;
+	addpath_id = 0;
+
+	addpath_capable = bgp_addpath_encode_rx(peer, afi, safi);
+
+	while (pnt < lim) {
+		/* Clear structures */
+		memset(&p, 0, sizeof(p));
+		memset(&unreach, 0, sizeof(unreach));
+
+		/* Get AddPath ID if applicable */
+		if (addpath_capable) {
+			if (pnt + BGP_ADDPATH_ID_LEN > lim)
+				return BGP_NLRI_PARSE_ERROR_PACKET_OVERFLOW;
+
+			memcpy(&addpath_id, pnt, BGP_ADDPATH_ID_LEN);
+			addpath_id = ntohl(addpath_id);
+			pnt += BGP_ADDPATH_ID_LEN;
+		}
+
+		/* Fetch prefix length */
+		if (pnt >= lim) {
+			zlog_err("%s: Premature end of unreachability NLRI", peer->host);
+			return BGP_NLRI_PARSE_ERROR_PACKET_LENGTH;
+		}
+
+		prefixlen = *pnt++;
+		p.family = afi2family(afi);
+		p.prefixlen = prefixlen;
+
+		/* Prefix length check */
+		if (prefixlen > prefix_blen(&p) * 8) {
+			zlog_err("%s: Invalid prefix length %d for AFI %u", peer->host, prefixlen,
+				 afi);
+			return BGP_NLRI_PARSE_ERROR_PREFIX_LENGTH;
+		}
+
+		/* Calculate size of prefix in bytes */
+		psize = PSIZE(prefixlen);
+
+		/* Check packet size */
+		if (pnt + psize > lim) {
+			zlog_err("%s: Prefix length %d overflows packet", peer->host, prefixlen);
+			return BGP_NLRI_PARSE_ERROR_PACKET_OVERFLOW;
+		}
+
+		/* Copy prefix and advance pointer */
+		if (psize > 0)
+			memcpy(&p.u.prefix, pnt, psize);
+		pnt += psize;
+
+		/* Parse TLVs for this NLRI.
+		 * Each NLRI has: [prefix][Reporter TLV(s)]
+		 * Withdrawals do NOT include TLVs - only parse for updates.
+		 */
+		if (!withdraw && pnt < lim) {
+			uint16_t remaining_in_packet = lim - pnt;
+
+			/* Read Reporter TLV header to determine its length */
+			if (remaining_in_packet < BGP_UNREACH_TLV_HEADER_LEN) {
+				zlog_err("%s: Insufficient Reporter TLV data for %pFX", peer->host,
+					 &p);
+				return BGP_NLRI_PARSE_ERROR;
+			}
+
+			/* Read Reporter TLV Length field (2 bytes, network byte order) */
+			uint16_t reporter_tlv_len = ((uint16_t)pnt[BGP_UNREACH_TLV_LEN_OFFSET]
+						     << 8) |
+						    pnt[BGP_UNREACH_TLV_LEN_OFFSET + 1];
+
+			/* Validate Reporter TLV length is within valid range */
+			if (reporter_tlv_len < BGP_UNREACH_REPORTER_FIXED_LEN) {
+				zlog_err("%s: Reporter TLV length %u too short (min %u) for %pFX",
+					 peer->host, reporter_tlv_len,
+					 BGP_UNREACH_REPORTER_FIXED_LEN, &p);
+				return BGP_NLRI_PARSE_ERROR;
+			}
+
+			uint16_t reporter_tlv_total = BGP_UNREACH_TLV_HEADER_LEN + reporter_tlv_len;
+
+			/* Validate Reporter TLV doesn't overflow remaining packet */
+			if (reporter_tlv_total > remaining_in_packet) {
+				zlog_err("%s: Reporter TLV length %u exceeds remaining packet %u for %pFX",
+					 peer->host, reporter_tlv_total, remaining_in_packet, &p);
+				return BGP_NLRI_PARSE_ERROR;
+			}
+
+			/* Parse Reporter TLV (extracts Reporter ID, AS, Sub-TLVs) */
+			if (bgp_unreach_tlv_parse(pnt, reporter_tlv_total, &unreach) < 0) {
+				zlog_err("%s: Failed to parse Reporter TLV for %pFX", peer->host,
+					 &p);
+				return BGP_NLRI_PARSE_ERROR;
+			}
+
+			/*
+			 * Advance pointer past THIS NLRI's Reporter TLV
+			 * to next NLRI.
+			 *
+			 * We expect 1 Reporter TLV per NLRI. If sender
+			 * includes multiple Reporter TLVs without
+			 * capability negotiation, they will be
+			 * misinterpreted as next NLRI, causing parse
+			 * error and UPDATE rejection.
+			 */
+			pnt += reporter_tlv_total;
+		}
+
+		/* Store prefix in unreach structure */
+		prefix_copy(&unreach.prefix, &p);
+
+		/* Store TLV data in attr for bgp_update() to access.
+		 * This follows the same pattern as EVPN (see bgp_route.c:5418-5421).
+		 */
+		if (attr && !withdraw) {
+			/* Allocate and attach TLV data to attributes */
+			struct bgp_unreach_nlri *unreach_copy =
+				XCALLOC(MTYPE_TMP, sizeof(struct bgp_unreach_nlri));
+			*unreach_copy = unreach;
+			attr->unreach_nlri = unreach_copy;
+		}
+
+		if (withdraw) {
+			bgp_withdraw(peer, &p, addpath_id, afi, safi, ZEBRA_ROUTE_BGP,
+				     BGP_ROUTE_NORMAL, NULL, NULL, 0, NULL);
+		} else {
+			bgp_update(peer, &p, addpath_id, attr, afi, safi, ZEBRA_ROUTE_BGP,
+				   BGP_ROUTE_NORMAL, NULL, NULL, 0, 0, NULL);
+		}
+
+		/* Free temporary TLV data */
+		if (attr && attr->unreach_nlri) {
+			XFREE(MTYPE_TMP, attr->unreach_nlri);
+			attr->unreach_nlri = NULL;
+		}
+
+		if (BGP_DEBUG(update, UPDATE_IN))
+			zlog_debug("%s: Processed unreachability info for %pFX via bgp_update()",
+				   peer->host, &p);
+	}
+
+	return 0;
+}
+
+/* Create new unreachability info */
 struct bgp_unreach_info *bgp_unreach_info_new(struct prefix *prefix)
 {
 	struct bgp_unreach_info *info;
