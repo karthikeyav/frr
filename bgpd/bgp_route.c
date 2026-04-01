@@ -64,6 +64,7 @@
 #include "bgpd/bgp_mac.h"
 #include "bgpd/bgp_network.h"
 #include "bgpd/bgp_trace.h"
+#include "bgpd/bgp_unreach.h"
 #include "bgpd/bgp_rpki.h"
 #include "bgpd/bgp_srv6.h"
 #include "bgpd/bgp_bfd.h"
@@ -6066,6 +6067,23 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		pi->uptime = monotime(NULL);
 		same_attr = attrhash_cmp(pi->attr, attr_new);
 
+		/* For SAFI_UNREACH, also compare TLVs since they're not part of interned attrs */
+		if (same_attr && safi == SAFI_UNREACH && new_attr.unreach_nlri && pi->extra &&
+		    pi->extra->unreach) {
+			struct bgp_path_info_extra_unreach *old_tlv = pi->extra->unreach;
+			struct bgp_unreach_nlri *new_tlv = new_attr.unreach_nlri;
+
+			if (old_tlv->reason_code != new_tlv->reason_code ||
+			    old_tlv->has_reason_code != new_tlv->has_reason_code ||
+			    old_tlv->timestamp != new_tlv->timestamp ||
+			    old_tlv->has_timestamp != new_tlv->has_timestamp ||
+			    old_tlv->reporter.s_addr != new_tlv->reporter.s_addr ||
+			    old_tlv->has_reporter != new_tlv->has_reporter) {
+				/* TLVs changed - not a duplicate */
+				same_attr = 0;
+			}
+		}
+
 		hook_call(bgp_process, bgp, afi, safi, dest, peer, true);
 
 		/* Same attribute comes in. */
@@ -6280,6 +6298,28 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 			pi->extra->labels = bgp_labels_intern(&bgp_labels);
 		}
 
+		/*
+		 * Update SAFI_UNREACH TLV data.
+		 * Use new_attr (not attr_new) because attr_new is
+		 * interned and doesn't have unreach_nlri.
+		 */
+		if (safi == SAFI_UNREACH && new_attr.unreach_nlri) {
+			extra = bgp_path_info_extra_get(pi);
+			if (!extra->unreach)
+				extra->unreach = XCALLOC(
+					MTYPE_BGP_ROUTE_EXTRA_UNREACH,
+					sizeof(struct bgp_path_info_extra_unreach));
+			/* Update TLV data from NLRI */
+			extra->unreach->timestamp = new_attr.unreach_nlri->timestamp;
+			extra->unreach->has_timestamp = new_attr.unreach_nlri->has_timestamp;
+			extra->unreach->reason_code = new_attr.unreach_nlri->reason_code;
+			extra->unreach->has_reason_code = new_attr.unreach_nlri->has_reason_code;
+			extra->unreach->reporter = new_attr.unreach_nlri->reporter;
+			extra->unreach->has_reporter = new_attr.unreach_nlri->has_reporter;
+			extra->unreach->reporter_as = new_attr.unreach_nlri->reporter_as;
+			extra->unreach->has_reporter_as = new_attr.unreach_nlri->has_reporter_as;
+		}
+
 #ifdef ENABLE_BGP_VNC
 		if ((afi == AFI_IP || afi == AFI_IP6)
 		    && (safi == SAFI_UNICAST)) {
@@ -6427,6 +6467,36 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 	/* Update MPLS label */
 	bgp_path_info_extra_get(new);
 	new->extra->labels = bgp_labels_intern(&bgp_labels);
+
+	/* Store SAFI_UNREACH TLV data from NLRI into path extra.
+	 * NOTE: We must check the ORIGINAL attr passed to bgp_update(), not attr_new,
+	 * because attr_new is the interned attr which doesn't have unreach_nlri populated.
+	 */
+	if (safi == SAFI_UNREACH) {
+		struct bgp_unreach_nlri *unreach_data_copy = NULL;
+
+		if (new_attr.unreach_nlri)
+			unreach_data_copy = new_attr.unreach_nlri;
+
+		if (unreach_data_copy) {
+			struct bgp_path_info_extra *extra =
+				bgp_path_info_extra_get(new);
+
+			if (!extra->unreach)
+				extra->unreach = XCALLOC(
+					MTYPE_BGP_ROUTE_EXTRA_UNREACH,
+					sizeof(struct bgp_path_info_extra_unreach));
+			}
+			extra->unreach->timestamp = unreach_data_copy->timestamp;
+			extra->unreach->has_timestamp = unreach_data_copy->has_timestamp;
+			extra->unreach->reason_code = unreach_data_copy->reason_code;
+			extra->unreach->has_reason_code = unreach_data_copy->has_reason_code;
+			extra->unreach->reporter = unreach_data_copy->reporter;
+			extra->unreach->has_reporter = unreach_data_copy->has_reporter;
+			extra->unreach->reporter_as = unreach_data_copy->reporter_as;
+			extra->unreach->has_reporter_as = unreach_data_copy->has_reporter_as;
+		}
+	}
 
 	bgp_update_check_valid_flags(bgp, peer, dest, p, afi, safi, new, attr_new,
 				     bgp_nht_param_prefix, accept_own);
@@ -11550,7 +11620,8 @@ void route_vty_out(struct vty *vty, const struct prefix *p, struct bgp_path_info
 					esi_to_str(&attr->esi,
 					esi_buf, sizeof(esi_buf)));
 		}
-		if (safi == SAFI_EVPN && bgp_attr_exists(attr, BGP_ATTR_EXT_COMMUNITIES)) {
+		if ((safi == SAFI_EVPN || safi == SAFI_UNREACH) &&
+		    bgp_attr_exists(attr, BGP_ATTR_EXT_COMMUNITIES)) {
 			json_ext_community = json_object_new_object();
 			json_object_string_add(
 				json_ext_community, "string",
@@ -14692,6 +14763,12 @@ static int bgp_show_route_in_table(struct vty *vty, struct bgp *bgp, struct bgp_
 			else
 				json_object_free(json_paths);
 		}
+	} else if (safi == SAFI_UNREACH) {
+		/* Use custom unreachability display for SAFI_UNREACH */
+		if (use_json)
+			json_object_free(json);
+		bgp_unreach_show(vty, bgp, afi, &match, use_json, false);
+		return CMD_SUCCESS;
 	} else {
 		dest = bgp_node_match(rib, &match);
 		if (dest != NULL) {
@@ -16302,8 +16379,15 @@ static int bgp_peer_counts(struct vty *vty, struct peer *peer, afi_t afi,
 		json_loop = json_object_new_object();
 	}
 
-	if (!peer || !peer->bgp || !peer->afc[afi][safi]
-	    || !peer->bgp->rib[afi][safi]) {
+	/* Check if AFI/SAFI is activated. For SAFI_UNREACH, also allow if
+	 * capability was negotiated (afc_nego) since routes may exist even if
+	 * afc is not properly set in some edge cases.
+	 */
+	bool afi_safi_active = peer && peer->bgp &&
+			       (peer->afc[afi][safi] ||
+				(safi == SAFI_UNREACH && peer->afc_nego[afi][safi])) &&
+			       peer->bgp->rib[afi][safi];
+	if (!afi_safi_active) {
 		if (use_json) {
 			json_object_string_add(
 				json, "warning",
@@ -16378,21 +16462,15 @@ static int bgp_peer_counts(struct vty *vty, struct peer *peer, afi_t afi,
 	return CMD_SUCCESS;
 }
 
-DEFUN (show_ip_bgp_instance_neighbor_prefix_counts,
-       show_ip_bgp_instance_neighbor_prefix_counts_cmd,
-       "show [ip] bgp [<view|vrf> VIEWVRFNAME] ["BGP_AFI_CMD_STR" ["BGP_SAFI_CMD_STR"]] neighbors <A.B.C.D|X:X::X:X|WORD> prefix-counts [json]",
-       SHOW_STR
-       IP_STR
-       BGP_STR
-       BGP_INSTANCE_HELP_STR
-       BGP_AFI_HELP_STR
-       BGP_SAFI_HELP_STR
-       "Detailed information on TCP and BGP neighbor connections\n"
-       "Neighbor to display information about\n"
-       "Neighbor to display information about\n"
-       "Neighbor on BGP configured interface\n"
-       "Display detailed prefix count information\n"
-       JSON_STR)
+DEFUN(show_ip_bgp_instance_neighbor_prefix_counts, show_ip_bgp_instance_neighbor_prefix_counts_cmd,
+      "show [ip] bgp [<view|vrf> VIEWVRFNAME] [" BGP_AFI_CMD_STR " [" BGP_SAFI_WITH_LABEL_CMD_STR
+      "]] neighbors <A.B.C.D|X:X::X:X|WORD> prefix-counts [json]",
+      SHOW_STR IP_STR BGP_STR BGP_INSTANCE_HELP_STR BGP_AFI_HELP_STR BGP_SAFI_WITH_LABEL_HELP_STR
+      "Detailed information on TCP and BGP neighbor connections\n"
+      "Neighbor to display information about\n"
+      "Neighbor to display information about\n"
+      "Neighbor on BGP configured interface\n"
+      "Display detailed prefix count information\n" JSON_STR)
 {
 	afi_t afi = AFI_IP6;
 	safi_t safi = SAFI_UNICAST;
@@ -16952,6 +17030,7 @@ static void show_adj_route(struct vty *vty, struct peer *peer, struct bgp_table 
 	}
 }
 
+
 static int peer_adj_routes(struct vty *vty, struct peer *peer, afi_t afi,
 			   safi_t safi, enum bgp_show_adj_route_type type,
 			   const char *rmap_name, const struct prefix *match,
@@ -16994,7 +17073,13 @@ static int peer_adj_routes(struct vty *vty, struct peer *peer, afi_t afi,
 		json_ar = json_object_new_object();
 	}
 
-	if (!peer || !peer->afc[afi][safi]) {
+	/* Check if AFI/SAFI is activated. For SAFI_UNREACH, also allow if
+	 * capability was negotiated (afc_nego) since routes may exist even if
+	 * afc is not properly set in some edge cases.
+	 */
+	bool afi_safi_active = peer && (peer->afc[afi][safi] ||
+					(safi == SAFI_UNREACH && peer->afc_nego[afi][safi]));
+	if (!peer || !afi_safi_active) {
 		if (use_json) {
 			if (type == bgp_show_adj_route_advertised ||
 			    type == bgp_show_adj_route_received) {
@@ -17455,7 +17540,13 @@ static int bgp_show_neighbor_route(struct vty *vty, struct peer *peer,
 	if (use_json)
 		SET_FLAG(show_flags, BGP_SHOW_OPT_JSON);
 
-	if (!peer || !peer->afc[afi][safi]) {
+	/* Check if AFI/SAFI is activated. For SAFI_UNREACH, also allow if
+	 * capability was negotiated (afc_nego) since routes may exist even if
+	 * afc is not properly set in some edge cases.
+	 */
+	bool afi_safi_active = peer && (peer->afc[afi][safi] ||
+					(safi == SAFI_UNREACH && peer->afc_nego[afi][safi]));
+	if (!peer || !afi_safi_active) {
 		if (use_json) {
 			json_object *json_no = NULL;
 			json_no = json_object_new_object();
